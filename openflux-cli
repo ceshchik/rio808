@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# OpenFlux CLI launcher script
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -f "$DIR/.venv/bin/python" ]; then
+    PYTHON="$DIR/.venv/bin/python"
+elif [ -f "$DIR/.venv/bin/python3" ]; then
+    PYTHON="$DIR/.venv/bin/python3"
+else
+    PYTHON="$(command -v python3)"
+fi
+
+if [ -z "$PYTHON" ]; then
+    echo "[-] Error: python3 is required to run openflux-cli." >&2
+    exit 1
+fi
+
+exec "$PYTHON" "$DIR/openflux_cli/main.py" "$@"

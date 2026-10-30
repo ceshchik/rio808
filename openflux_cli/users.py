@@ -51,7 +51,7 @@ class UserManager:
         key: Optional[str] = None,
         mode: str = "l4",
         negotiate: bool = True,
-        encrypted: bool = True,
+        encrypted: bool = False,
     ) -> dict:
         """Create and store a new user profile with isolated keys."""
         if name in self.users:
@@ -110,13 +110,19 @@ class UserManager:
                 pass
             return False, 0
 
-    def start_user(self, name: str) -> bool:
-        """Start the OpenFlux exit node instance for the specified user."""
+    def start_user(
+        self,
+        name: str,
+        wait_for_link: bool = True,
+        timeout: float = 6.0,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Start the OpenFlux exit node instance for the specified user and wait for share link."""
         user = self.get_user(name)
         running, pid = self.is_user_running(name)
         if running:
             print(f"[!] User '{name}' is already running with PID {pid}.")
-            return False
+            link, qr = self.extract_share_info_from_logs(name)
+            return True, link, qr
 
         key_path = Path(user["key_file"]) if user.get("key_file") else None
         cmd = build_openflux_command(
@@ -130,12 +136,31 @@ class UserManager:
             bin_path=BIN_PATH,
         )
 
-        run_openflux_background(name, cmd)
+        proc = run_openflux_background(name, cmd)
 
-        # Give it a moment to initialize and generate share link
-        time.sleep(1.5)
-        self.extract_share_link_from_logs(name)
-        return True
+        link = None
+        qr_code = None
+
+        if wait_for_link:
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                time.sleep(0.3)
+                if proc.poll() is not None:
+                    print(f"[-] Процесс OpenFlux для '{name}' завершился (код {proc.returncode}).")
+                    log_file = LOGS_DIR / f"{name}.log"
+                    if log_file.exists():
+                        try:
+                            lines = log_file.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
+                            print(f"[-] Последние строки лога:\n" + "\n".join(lines[-6:]))
+                        except Exception:
+                            pass
+                    return False, None, None
+
+                link, qr_code = self.extract_share_info_from_logs(name)
+                if link:
+                    break
+
+        return True, link, qr_code
 
     def stop_user(self, name: str) -> bool:
         """Stop the OpenFlux exit node instance for the specified user."""
@@ -182,12 +207,13 @@ class UserManager:
         user = self.users.pop(name)
         self._save_users()
 
-        key_file = Path(user.get("key_file", ""))
-        if key_file.exists():
-            try:
-                key_file.unlink()
-            except OSError:
-                pass
+        if user.get("key_file"):
+            key_file = Path(user["key_file"])
+            if key_file.exists():
+                try:
+                    key_file.unlink()
+                except OSError:
+                    pass
 
         if not keep_logs:
             log_file = LOGS_DIR / f"{name}.log"
@@ -210,25 +236,45 @@ class UserManager:
             result.append(item)
         return result
 
-    def extract_share_link_from_logs(self, name: str) -> Optional[str]:
-        """Scans the user's log file for openflux://v1/ links and saves it."""
+    def extract_share_info_from_logs(self, name: str) -> Tuple[Optional[str], Optional[str]]:
+        """Scans the user's log file for openflux://v1/ link and the terminal QR code."""
         log_file = LOGS_DIR / f"{name}.log"
         if not log_file.exists():
-            return None
+            return None, None
 
         link = None
+        qr_lines = []
         try:
             with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if "openflux://v1/" in line:
-                        start_idx = line.find("openflux://v1/")
-                        link = line[start_idx:].strip().split()[0]
-        except Exception:
-            return None
+                lines = f.readlines()
 
-        if link and link != self.users[name].get("last_share_link"):
-            self.users[name]["last_share_link"] = link
-            self._save_users()
+            for line in lines:
+                if "openflux://v1/" in line:
+                    start_idx = line.find("openflux://v1/")
+                    link = line[start_idx:].strip().split()[0]
+
+            capturing = False
+            for line in lines:
+                stripped = line.rstrip("\r\n")
+                if any(c in stripped for c in ["▀", "▄", "█"]):
+                    capturing = True
+                    qr_lines.append(stripped)
+                elif capturing:
+                    break
+
+            qr_code = "\n".join(qr_lines) if qr_lines else None
+
+            if link and link != self.users[name].get("last_share_link"):
+                self.users[name]["last_share_link"] = link
+                self._save_users()
+
+            return link, qr_code
+        except Exception:
+            return None, None
+
+    def extract_share_link_from_logs(self, name: str) -> Optional[str]:
+        """Scans the user's log file for openflux://v1/ links and saves it."""
+        link, _ = self.extract_share_info_from_logs(name)
         return link
 
     def generate_systemd_template(self) -> str:

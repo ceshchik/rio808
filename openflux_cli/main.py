@@ -7,6 +7,7 @@ A complete tool for managing OpenFlux covert VPN tunnels and multi-user setups.
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 # Add project root to sys.path
@@ -14,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from openflux_cli.config import (
     BIN_PATH,
+    LOGS_DIR,
     SUPPORTED_TRANSPORTS,
     ensure_directories,
 )
@@ -25,6 +27,67 @@ from openflux_cli.runner import (
     run_openflux_foreground,
 )
 from openflux_cli.users import UserManager
+
+
+def resolve_transport_and_url(pos_args, transport_flag=None, url_flag=None, default_transport="telemost"):
+    """
+    Intelligently resolves transport and url from positional arguments, flags, or interactive prompt.
+    Supported calls:
+      - [url]                     -> transport=default_transport, url=url
+      - [transport, url]          -> transport=transport, url=url
+      - -t [transport] -u [url]   -> transport=transport, url=url
+      - no args                   -> prompts interactively for transport, then url
+    """
+    transport = transport_flag
+    url = url_flag
+
+    pos = [p for p in pos_args if not p.startswith("-")] if pos_args else []
+
+    if pos:
+        if len(pos) == 1:
+            val = pos[0]
+            if val in SUPPORTED_TRANSPORTS and not url:
+                transport = val
+            else:
+                url = val
+                if not transport:
+                    transport = default_transport
+        elif len(pos) >= 2:
+            if pos[0] in SUPPORTED_TRANSPORTS:
+                transport = pos[0]
+                url = pos[1]
+            elif pos[1] in SUPPORTED_TRANSPORTS:
+                url = pos[0]
+                transport = pos[1]
+            else:
+                transport = pos[0]
+                url = pos[1]
+
+    if not transport:
+        transport = default_transport
+
+    # Interactive prompt if url is still missing and running in interactive shell
+    if not url and sys.stdin.isatty():
+        try:
+            print("\n" + "=" * 60)
+            print("Параметры подключения OpenFlux")
+            print("=" * 60)
+            entered_t = input(f"Выберите транспорт [{transport}]: ").strip()
+            if entered_t:
+                transport = entered_t
+            while not url:
+                url = input("Введите ссылку для подключения (URL конференции / документа): ").strip()
+                if not url:
+                    print("[-] Ссылка не может быть пустой!")
+        except (KeyboardInterrupt, EOFError):
+            print("\n[*] Отменено.")
+            sys.exit(0)
+
+    if not url:
+        print("[-] Ошибка: не указана ссылка для подключения (URL). Передайте её аргументом или флагом --url.", file=sys.stderr)
+        sys.exit(1)
+
+    return transport, url
 
 
 def cmd_install(args):
@@ -45,7 +108,7 @@ def cmd_install(args):
 
 
 def cmd_start(args):
-    """Handle starting a VPN tunnel with encryption."""
+    """Handle starting a VPN tunnel."""
     if not BIN_PATH.exists():
         print(f"[!] OpenFlux binary not found at {BIN_PATH}.")
         print("[*] Running automatic installation...")
@@ -53,42 +116,74 @@ def cmd_start(args):
 
     ensure_directories()
 
-    # Determine encryption key
+    all_args = getattr(args, "args", []) or []
+    pos_args = [a for a in all_args if not a.startswith("-")]
+    extra_flags = [a for a in all_args if a.startswith("-")]
+
+    transport, url = resolve_transport_and_url(
+        pos_args=pos_args,
+        transport_flag=args.transport,
+        url_flag=args.url,
+        default_transport="telemost",
+    )
+
+    # Determine encryption: DEFAULT IS NO ENCRYPTION
+    encrypted = False
+    if getattr(args, 'encrypt', False) or getattr(args, 'encryption', False) or args.key or args.key_file:
+        encrypted = True
+    if getattr(args, 'no_encryption', False):
+        encrypted = False
+
     key_file = None
-    if args.no_encryption:
-        print("[*] Running in UNENCRYPTED mode (--no-encryption).")
-        key_file = None
-    elif args.key:
-        key_file = generate_encryption_key(name="temp_key")
-        with open(key_file, "w", encoding="utf-8") as f:
-            f.write(args.key.strip())
-        print(f"[*] Using provided secret key.")
-    elif args.key_file:
-        key_file = Path(args.key_file)
-        if not key_file.exists():
-            print(f"[-] Key file not found: {key_file}", file=sys.stderr)
-            sys.exit(1)
-        print(f"[*] Using key file: {key_file}")
+    if encrypted:
+        if args.key:
+            key_file = generate_encryption_key(name="temp_key")
+            with open(key_file, "w", encoding="utf-8") as f:
+                f.write(args.key.strip())
+            print("[*] Использован переданный ключ шифрования.")
+        elif args.key_file:
+            key_file = Path(args.key_file)
+            if not key_file.exists():
+                print(f"[-] Файл ключа не найден: {key_file}", file=sys.stderr)
+                sys.exit(1)
+            print(f"[*] Использован файл ключа: {key_file}")
+        else:
+            key_file = generate_encryption_key(name=args.name or "session")
+            print(f"[+] Сгенерирован новый AES-256 ключ шифрования: {key_file}")
     else:
-        # Automatically generate AES-256 secret key
-        key_file = generate_encryption_key(name=args.name or "session")
-        print(f"[+] Auto-generated new AES-256 encryption key: {key_file}")
+        print("[*] Режим шифрования: ВЫКЛЮЧЕНО (по умолчанию).")
 
     cmd = build_openflux_command(
         role=args.role,
         mode=args.mode,
-        transport=args.transport,
-        url=args.url,
+        transport=transport,
+        url=url,
         key_file=key_file,
         share=not args.no_share,
-        negotiate=not args.no_negotiate,
+        negotiate=not args.no_negotiate if encrypted else False,
         bin_path=BIN_PATH,
-        extra_args=args.extra,
+        extra_args=extra_flags,
     )
 
     if args.background:
-        name = args.name or f"{args.transport}_node"
+        name = args.name or f"{transport}_node"
         run_openflux_background(name, cmd)
+        print(f"[*] Ожидание инициализации и ссылки подключения...")
+        time.sleep(1.0)
+        start_t = time.time()
+        link, qr = None, None
+        um = UserManager()
+        while time.time() - start_t < 6.0:
+            time.sleep(0.3)
+            link, qr = um.extract_share_info_from_logs(name)
+            if link:
+                break
+        if qr:
+            print("\n[+] QR-код для подключения:")
+            print(qr)
+        if link:
+            print(f"\n[+] Ссылка для подключения (вставьте в приложение OpenFlux):")
+            print(f"    {link}\n")
     else:
         run_openflux_foreground(cmd)
 
@@ -98,29 +193,85 @@ def cmd_user(args, um: UserManager):
     sub = args.user_cmd
 
     if sub == "add":
-        if not args.name or not args.url:
-            print("[-] Missing required arguments: user name and URL (--url) are required.", file=sys.stderr)
+        name = args.name
+        all_args = getattr(args, "args", []) or []
+        pos_args = [a for a in all_args if not a.startswith("-")]
+
+        # If name is not given, prompt interactively
+        if not name and sys.stdin.isatty():
+            try:
+                print("\n" + "=" * 60)
+                print("Создание нового пользователя OpenFlux")
+                print("=" * 60)
+                while not name:
+                    name = input("Введите имя пользователя (например, alice): ").strip()
+                    if not name:
+                        print("[-] Имя пользователя не может быть пустым!")
+            except (KeyboardInterrupt, EOFError):
+                print("\n[*] Отменено.")
+                sys.exit(0)
+
+        if not name:
+            print("[-] Ошибка: укажите имя пользователя.", file=sys.stderr)
             sys.exit(1)
+
+        transport, url = resolve_transport_and_url(
+            pos_args=pos_args,
+            transport_flag=args.transport,
+            url_flag=args.url,
+            default_transport="telemost",
+        )
+
+        # Encryption: DEFAULT IS NO ENCRYPTION
+        encrypted = False
+        if getattr(args, 'encrypt', False) or getattr(args, 'encryption', False) or args.key:
+            encrypted = True
+        if getattr(args, 'no_encryption', False):
+            encrypted = False
+
+        if not BIN_PATH.exists():
+            print(f"[!] Бинарник OpenFlux не найден. Скачивание...")
+            cmd_install(argparse.Namespace(target=None, version=None, build=False))
+
         try:
             user = um.add_user(
-                name=args.name,
-                transport=args.transport,
-                url=args.url,
+                name=name,
+                transport=transport,
+                url=url,
                 key=args.key,
                 mode=args.mode,
-                negotiate=not args.no_negotiate if not args.no_encryption else False,
-                encrypted=not args.no_encryption,
+                negotiate=not args.no_negotiate if encrypted else False,
+                encrypted=encrypted,
             )
-            print(f"[+] Successfully added user '{args.name}'.")
-            print(f"    Transport: {user['transport']}")
-            print(f"    URL:       {user['url']}")
-            print(f"    Key file:  {user['key_file']}")
-            print(f"    Mode:      {user['mode']}")
-            print(f"\n[*] Start this user's connection with:")
-            print(f"    openflux-cli user start {args.name}")
         except Exception as e:
-            print(f"[-] Error adding user: {e}", file=sys.stderr)
+            print(f"[-] Ошибка добавления пользователя: {e}", file=sys.stderr)
             sys.exit(1)
+
+        # Automatically start user immediately and display connection link & QR code!
+        if not args.no_start:
+            print(f"[*] Запуск туннеля для пользователя '{name}'...")
+            started, link, qr_code = um.start_user(name, wait_for_link=True, timeout=8.0)
+            if started:
+                print("\n" + "=" * 70)
+                print(f"[+] Пользователь '{name}' успешно создан и запущен!")
+                print("=" * 70)
+                print(f"Транспорт:  {transport}")
+                print(f"Ссылка URL: {url}")
+                print(f"Шифрование: {'ВКЛЮЧЕНО (AES-256)' if encrypted else 'ВЫКЛЮЧЕНО (по умолчанию)'}")
+
+                if qr_code:
+                    print("\n[+] QR-код для подключения:")
+                    print(qr_code)
+
+                if link:
+                    print("\n[+] Ссылка для подключения (вставьте в приложение OpenFlux):")
+                    print(f"    {link}\n")
+                else:
+                    print(f"\n[*] Ссылка формируется. Вы можете проверить её командой:")
+                    print(f"    openflux-cli user share {name}")
+                print("=" * 70 + "\n")
+        else:
+            print(f"[+] Пользователь '{name}' успешно создан (автозапуск отключён).")
 
     elif sub == "start":
         if not args.name:
@@ -129,7 +280,14 @@ def cmd_user(args, um: UserManager):
         if not BIN_PATH.exists():
             print(f"[!] OpenFlux binary not found. Installing first...")
             cmd_install(argparse.Namespace(target=None, version=None, build=False))
-        um.start_user(args.name)
+        started, link, qr_code = um.start_user(args.name, wait_for_link=True)
+        if started:
+            if qr_code:
+                print("\n[+] QR-код:")
+                print(qr_code)
+            if link:
+                print(f"\n[+] Ссылка для подключения:")
+                print(f"    {link}\n")
 
     elif sub == "stop":
         if not args.name:
@@ -146,7 +304,7 @@ def cmd_user(args, um: UserManager):
     elif sub == "list":
         users = um.list_users()
         if not users:
-            print("No users configured yet. Add one with: openflux-cli user add <name> --url <url>")
+            print("No users configured yet. Add one with: openflux-cli user add <name> [transport] <url>")
             return
 
         print("\n" + "=" * 80)
@@ -163,15 +321,19 @@ def cmd_user(args, um: UserManager):
             print("[-] Specify user name.", file=sys.stderr)
             sys.exit(1)
         user = um.get_user(args.name)
-        link = um.extract_share_link_from_logs(args.name) or user.get("last_share_link")
+        link, qr_code = um.extract_share_info_from_logs(args.name)
+        link = link or user.get("last_share_link")
         print("=" * 60)
         print(f"Connection details for User: {args.name}")
         print("=" * 60)
-        print(f"Transport: {user['transport']}")
-        print(f"URL:       {user['url']}")
-        print(f"Key file:  {user['key_file']}")
+        print(f"Transport:  {user['transport']}")
+        print(f"URL:        {user['url']}")
+        print(f"Encryption: {'Enabled' if user.get('key_file') else 'Disabled'}")
+        if qr_code:
+            print("\n[+] QR Code:")
+            print(qr_code)
         if link:
-            print(f"\n[+] Client Share Link (Import in OpenFlux mobile/desktop app):")
+            print(f"\n[+] Client Share Link:")
             print(f"\n    {link}\n")
         else:
             print(f"\n[*] Link not captured yet. Make sure the user is started (openflux-cli user start {args.name}).")
@@ -186,7 +348,6 @@ def cmd_user(args, um: UserManager):
         um.delete_user(args.name)
 
     elif sub == "run-service":
-        # Used by systemd service unit to run in foreground
         if not args.name:
             sys.exit(1)
         user = um.get_user(args.name)
@@ -262,33 +423,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--build", action="store_true", help="Compile from source with Go instead of prebuilt binary")
 
     # start command
-    p_start = subparsers.add_parser("start", help="Start VPN connection with encryption")
-    p_start.add_argument("--transport", "-t", default="telemost", choices=SUPPORTED_TRANSPORTS, help="Transport protocol (default: telemost)")
-    p_start.add_argument("--url", "-u", required=True, help="Connection URL (e.g. Telemost conference link)")
+    p_start = subparsers.add_parser("start", help="Start VPN connection (without encryption by default)")
+    p_start.add_argument("args", nargs="*", help="[transport] <url> (transport defaults to telemost if omitted)")
+    p_start.add_argument("--transport", "-t", choices=SUPPORTED_TRANSPORTS, help="Transport protocol (default: telemost)")
+    p_start.add_argument("--url", "-u", help="Connection URL (e.g. Telemost conference link)")
     p_start.add_argument("--role", "-r", default="exit", choices=["exit", "client"], help="Role: exit (server) or client (default: exit)")
     p_start.add_argument("--mode", "-m", default="l4", choices=["l4", "l3"], help="Exit backend mode: l4 (gVisor userspace) or l3 (Linux raw) (default: l4)")
-    p_start.add_argument("--key-file", "-k", help="Path to shared secret key file (auto-generated if omitted)")
+    p_start.add_argument("--encrypt", "--encryption", action="store_true", dest="encrypt", help="Enable AES-256 encryption (default: disabled)")
+    p_start.add_argument("--no-encryption", action="store_true", help="Explicitly disable encryption (already default)")
+    p_start.add_argument("--key-file", "-k", help="Path to shared secret key file")
     p_start.add_argument("--key", help="Inline shared secret key (min 16 chars)")
-    p_start.add_argument("--no-encryption", action="store_true", help="Run without AES encryption (plain carrier traffic)")
     p_start.add_argument("--no-negotiate", action="store_true", help="Disable authenticated capability negotiation")
     p_start.add_argument("--no-share", action="store_true", help="Disable printing openflux:// link and QR code")
     p_start.add_argument("--background", "-d", action="store_true", help="Run in background daemon mode")
     p_start.add_argument("--name", help="Name identifier for background run or key")
-    p_start.add_argument("extra", nargs="*", help="Additional flags passed directly to OpenFlux")
 
     # user command
     p_user = subparsers.add_parser("user", help="Manage multi-user VPN channels")
     user_subs = p_user.add_subparsers(dest="user_cmd")
 
     # user add
-    p_u_add = user_subs.add_parser("add", help="Add a new user channel")
-    p_u_add.add_argument("name", help="Unique user name identifier")
-    p_u_add.add_argument("--url", "-u", required=True, help="User's dedicated conference/document URL")
-    p_u_add.add_argument("--transport", "-t", default="telemost", choices=SUPPORTED_TRANSPORTS, help="Transport (default: telemost)")
-    p_u_add.add_argument("--key", help="Custom secret key (auto-generated if omitted)")
-    p_u_add.add_argument("--no-encryption", action="store_true", help="Configure user without encryption")
+    p_u_add = user_subs.add_parser("add", help="Add and start a new user channel")
+    p_u_add.add_argument("name", nargs="?", help="Unique user name identifier")
+    p_u_add.add_argument("args", nargs="*", help="[transport] <url> (transport defaults to telemost if omitted)")
+    p_u_add.add_argument("--transport", "-t", choices=SUPPORTED_TRANSPORTS, help="Transport (default: telemost)")
+    p_u_add.add_argument("--url", "-u", help="User's dedicated conference/document URL")
+    p_u_add.add_argument("--encrypt", "--encryption", action="store_true", dest="encrypt", help="Enable encryption (default: disabled)")
+    p_u_add.add_argument("--no-encryption", action="store_true", help="Explicitly disable encryption (already default)")
+    p_u_add.add_argument("--key", help="Custom secret key")
     p_u_add.add_argument("--mode", "-m", default="l4", choices=["l4", "l3"], help="Exit mode (default: l4)")
     p_u_add.add_argument("--no-negotiate", action="store_true", help="Disable capability negotiation")
+    p_u_add.add_argument("--no-start", action="store_true", help="Do not auto-start user after creation")
 
     # user start / stop / restart / share / delete
     for action in ["start", "stop", "restart", "share", "delete", "run-service"]:

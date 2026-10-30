@@ -51,26 +51,29 @@ class UserManager:
         key: Optional[str] = None,
         mode: str = "l4",
         negotiate: bool = True,
+        encrypted: bool = True,
     ) -> dict:
         """Create and store a new user profile with isolated keys."""
         if name in self.users:
             raise ValueError(f"User '{name}' already exists.")
 
-        key_path = KEYS_DIR / f"{name}.key"
-        if key:
-            with open(key_path, "w", encoding="utf-8") as f:
-                f.write(key.strip())
-            os.chmod(key_path, 0o600)
-        else:
-            generate_encryption_key(key_path, name=name)
+        key_path = None
+        if encrypted:
+            key_path = KEYS_DIR / f"{name}.key"
+            if key:
+                with open(key_path, "w", encoding="utf-8") as f:
+                    f.write(key.strip())
+                os.chmod(key_path, 0o600)
+            else:
+                generate_encryption_key(key_path, name=name)
 
         user_data = {
             "name": name,
             "transport": transport,
             "url": url,
             "mode": mode,
-            "key_file": str(key_path),
-            "negotiate": negotiate,
+            "key_file": str(key_path) if key_path else None,
+            "negotiate": negotiate if encrypted else False,
             "created_at": datetime.now().isoformat(),
             "last_share_link": "",
         }
@@ -115,14 +118,15 @@ class UserManager:
             print(f"[!] User '{name}' is already running with PID {pid}.")
             return False
 
+        key_path = Path(user["key_file"]) if user.get("key_file") else None
         cmd = build_openflux_command(
             role="exit",
             mode=user.get("mode", "l4"),
             transport=user.get("transport", "telemost"),
             url=user.get("url", ""),
-            key_file=Path(user["key_file"]),
+            key_file=key_path,
             share=True,
-            negotiate=user.get("negotiate", True),
+            negotiate=user.get("negotiate", True) if key_path else False,
             bin_path=BIN_PATH,
         )
 

@@ -55,7 +55,10 @@ def cmd_start(args):
 
     # Determine encryption key
     key_file = None
-    if args.key:
+    if args.no_encryption:
+        print("[*] Running in UNENCRYPTED mode (--no-encryption).")
+        key_file = None
+    elif args.key:
         key_file = generate_encryption_key(name="temp_key")
         with open(key_file, "w", encoding="utf-8") as f:
             f.write(args.key.strip())
@@ -105,7 +108,8 @@ def cmd_user(args, um: UserManager):
                 url=args.url,
                 key=args.key,
                 mode=args.mode,
-                negotiate=not args.no_negotiate,
+                negotiate=not args.no_negotiate if not args.no_encryption else False,
+                encrypted=not args.no_encryption,
             )
             print(f"[+] Successfully added user '{args.name}'.")
             print(f"    Transport: {user['transport']}")
@@ -186,14 +190,15 @@ def cmd_user(args, um: UserManager):
         if not args.name:
             sys.exit(1)
         user = um.get_user(args.name)
+        key_path = Path(user["key_file"]) if user.get("key_file") else None
         cmd = build_openflux_command(
             role="exit",
             mode=user.get("mode", "l4"),
             transport=user.get("transport", "telemost"),
             url=user.get("url", ""),
-            key_file=Path(user["key_file"]),
+            key_file=key_path,
             share=True,
-            negotiate=user.get("negotiate", True),
+            negotiate=user.get("negotiate", True) if key_path else False,
             bin_path=BIN_PATH,
         )
         run_openflux_foreground(cmd)
@@ -264,6 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--mode", "-m", default="l4", choices=["l4", "l3"], help="Exit backend mode: l4 (gVisor userspace) or l3 (Linux raw) (default: l4)")
     p_start.add_argument("--key-file", "-k", help="Path to shared secret key file (auto-generated if omitted)")
     p_start.add_argument("--key", help="Inline shared secret key (min 16 chars)")
+    p_start.add_argument("--no-encryption", action="store_true", help="Run without AES encryption (plain carrier traffic)")
     p_start.add_argument("--no-negotiate", action="store_true", help="Disable authenticated capability negotiation")
     p_start.add_argument("--no-share", action="store_true", help="Disable printing openflux:// link and QR code")
     p_start.add_argument("--background", "-d", action="store_true", help="Run in background daemon mode")
@@ -280,6 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_u_add.add_argument("--url", "-u", required=True, help="User's dedicated conference/document URL")
     p_u_add.add_argument("--transport", "-t", default="telemost", choices=SUPPORTED_TRANSPORTS, help="Transport (default: telemost)")
     p_u_add.add_argument("--key", help="Custom secret key (auto-generated if omitted)")
+    p_u_add.add_argument("--no-encryption", action="store_true", help="Configure user without encryption")
     p_u_add.add_argument("--mode", "-m", default="l4", choices=["l4", "l3"], help="Exit mode (default: l4)")
     p_u_add.add_argument("--no-negotiate", action="store_true", help="Disable capability negotiation")
 
